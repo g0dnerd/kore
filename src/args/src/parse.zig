@@ -49,7 +49,7 @@ pub fn ArgParser(comptime max_args: usize) type {
                 // Arguments need a leading dash
                 if (a.len == 0 or a[0] != '-') return error.ExpectedArgument;
 
-                const arg_name = if (a.len > 1 and a[1] and a[2] == '-') a[3..] else a[2..];
+                const arg_name = if (a.len > 1 and a[1] == '-' and a[2] == '-') a[3..] else a[2..];
 
                 // Inline for to unroll at comptime and avoids runtime pointer access
                 var found = false;
