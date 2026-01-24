@@ -46,12 +46,12 @@ pub fn ArgParser(comptime max_args: usize) type {
             _ = arg_iter.skip();
 
             while (arg_iter.next()) |a| {
-                // Arguments need a leading dash
-                if (a.len == 0 or a[0] != '-') return error.ExpectedArgument;
+                // Arguments need two leading dashes
+                if (a.len == 0 or a[0] != '-' or a[1] != '-') return error.ExpectedArgument;
 
-                const arg_name = if (a.len > 1 and a[1] == '-') a[2..] else a[1..];
+                const arg_name = a[3..];
 
-                // Use inline for to unroll at comptime - this avoids runtime pointer access
+                // Inline for to unroll at comptime and avoid runtime pointer access
                 var found = false;
                 inline for (self.arguments[0..self.len], 0..) |arg, i| {
                     if (std.mem.eql(u8, arg_name, arg.name)) {
