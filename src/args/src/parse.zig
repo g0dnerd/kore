@@ -30,8 +30,7 @@ pub fn ArgParser(comptime max_args: usize) type {
 
         // Parse command line arguments at runtime.
         // Returns a struct with fields corresponding to the configured arguments.
-        pub fn parse(comptime self: Self) !self.ResultType() {
-            var arg_iter = std.process.args();
+        pub fn parse(comptime self: Self, arg_iter: std.process.Args.Iterator) !self.ResultType() {
             return self.parseFromIterator(&arg_iter);
         }
 
