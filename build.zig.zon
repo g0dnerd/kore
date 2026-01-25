@@ -2,9 +2,11 @@
     .name = .kore,
     .version = "0.0.1",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{ .args = .{
-        .path = "src/args",
-    } },
+    .dependencies = .{
+        .args = .{
+            .path = "src/args",
+        },
+    },
     .paths = .{
         "src",
         "build.zig",

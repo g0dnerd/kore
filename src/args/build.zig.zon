@@ -1,1 +1,11 @@
-.{ .name = .args, .version = "0.0.0", .dependencies = .{}, .paths = .{ "src", "build.zig", "build.zig.zon" }, .fingerprint = 0x161b2ea2e8de6e13 }
+.{
+    .name = .args,
+    .version = "0.0.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .fingerprint = 0x161b2ea2e8de6e13,
+}
