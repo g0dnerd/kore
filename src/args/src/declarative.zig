@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
@@ -83,7 +84,10 @@ test "make parser" {
     const ArgParser = try Parser(Args);
 
     const args_with_values = [_][*:0]const u8{ "prog", "--hi_mom", "25", "--name", "steve" };
-    var it = std.process.Args.Iterator.init(.{ .vector = &args_with_values });
+    var it = if (builtin.os.tag == .windows)
+        try std.process.Args.Iterator.initAllocator(.{ .vector = &args_with_values }, std.heap.page_allocator)
+    else
+        std.process.Args.Iterator.init(.{ .vector = &args_with_values });
 
     const resolved_args: Args = try ArgParser.parse(&it);
 
@@ -101,7 +105,10 @@ test "parse string with whitespace" {
     const ArgParser = try Parser(Args);
 
     const args_with_values = [_][*:0]const u8{ "prog", "--name", "steve oh" };
-    var it = std.process.Args.Iterator.init(.{ .vector = &args_with_values });
+    var it = if (builtin.os.tag == .windows)
+        try std.process.Args.Iterator.initAllocator(.{ .vector = &args_with_values }, std.heap.page_allocator)
+    else
+        std.process.Args.Iterator.init(.{ .vector = &args_with_values });
 
     const result: Args = try ArgParser.parse(&it);
     const name = result.name;
@@ -126,7 +133,10 @@ test "parse missing optional" {
     const ArgParser = try Parser(Args);
 
     const arguments = [_][*:0]const u8{ "prog", "--required", "42" };
-    var it = std.process.Args.Iterator.init(.{ .vector = &arguments });
+    var it = if (builtin.os.tag == .windows)
+        try std.process.Args.Iterator.initAllocator(.{ .vector = &arguments }, std.heap.page_allocator)
+    else
+        std.process.Args.Iterator.init(.{ .vector = &arguments });
 
     const resolved_args = try ArgParser.parse(&it);
 
@@ -141,7 +151,10 @@ test "parse missing required fails" {
     const ArgParser = try Parser(Args);
 
     const arguments = [_][*:0]const u8{"prog"};
-    var it = std.process.Args.Iterator.init(.{ .vector = &arguments });
+    var it = if (builtin.os.tag == .windows)
+        try std.process.Args.Iterator.initAllocator(.{ .vector = &arguments }, std.heap.page_allocator)
+    else
+        std.process.Args.Iterator.init(.{ .vector = &arguments });
 
     const result = ArgParser.parse(&it);
     try std.testing.expectError(error.MissingRequiredArgument, result);

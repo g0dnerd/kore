@@ -1,6 +1,5 @@
 const std = @import("std");
 
-pub const @"comptime" = @import("comptime.zig");
 pub const declarative = @import("declarative.zig");
 
 pub const ArgumentParseError = error{
