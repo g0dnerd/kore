@@ -6,9 +6,9 @@
         .args = .{
             .path = "src/args",
         },
-        .net = .{
-            .path = "src/net",
-        },
+        // .net = .{
+        //     .path = "src/net",
+        // },
     },
     .paths = .{
         "src",
