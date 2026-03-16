@@ -19,6 +19,10 @@ pub fn parseValue(comptime T: type, value_raw: []const u8, arg_name: []const u8)
             std.log.err("Invalid integer value {s} for argument {s}\n", .{ value_raw, arg_name });
             return error.InvalidValue;
         },
+        .float => std.fmt.parseFloat(T, value_raw) catch {
+            std.log.err("Invalid float value {s} for argument {s}\n", .{ value_raw, arg_name });
+            return error.InvalidValue;
+        },
         .optional => |opt| @as(T, try parseValue(opt.child, value_raw, arg_name)),
         .pointer => |p| {
             // []const u8
@@ -34,4 +38,8 @@ pub fn parseValue(comptime T: type, value_raw: []const u8, arg_name: []const u8)
         },
         else => error.Unimplemented,
     };
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

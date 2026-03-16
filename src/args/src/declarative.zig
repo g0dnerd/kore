@@ -115,6 +115,24 @@ test "parse string with whitespace" {
     try expectEqual("steve oh", name);
 }
 
+test "parse float" {
+    const Args = struct {
+        value: f32,
+    };
+
+    const ArgParser = try Parser(Args);
+
+    const args_with_values = [_][*:0]const u8{ "prog", "--value", "17.49" };
+    var it = if (builtin.os.tag == .windows)
+        try std.process.Args.Iterator.initAllocator(.{ .vector = &args_with_values }, std.heap.page_allocator)
+    else
+        std.process.Args.Iterator.init(.{ .vector = &args_with_values });
+
+    const result: Args = try ArgParser.parse(&it);
+    const value = result.value;
+    try expectEqual(17.49, value);
+}
+
 test "invalid args type" {
     const Args = enum {
         this,
