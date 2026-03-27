@@ -6,6 +6,9 @@
         .args = .{
             .path = "src/args",
         },
+        .io = .{
+            .path = "src/io",
+        },
         // .net = .{
         //     .path = "src/net",
         // },
