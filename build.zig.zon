@@ -9,9 +9,9 @@
         .io = .{
             .path = "src/io",
         },
-        // .net = .{
-        //     .path = "src/net",
-        // },
+        .ml = .{
+            .path = "src/ml",
+        },
     },
     .paths = .{
         "src",

@@ -1,0 +1,15 @@
+.{
+    .name = .ml,
+    .version = "0.0.0",
+    .dependencies = .{
+        .util = .{
+            .path = "../util",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .fingerprint = 0xd58e2a6616e0c61f,
+}
