@@ -8,6 +8,7 @@ pub const Op = enum {
     clipped_relu,
     sigmoid,
     sparse_accumulate,
+    concat,
 };
 
 pub const SavedContext = union(enum) {
@@ -16,6 +17,7 @@ pub const SavedContext = union(enum) {
     clipped_relu: ClippedReLU,
     sigmoid: Sigmoid,
     sparse_accumulate: SparseAccumulate,
+    concat: Concat,
 
     pub const Matmul = struct {
         input: *Tensor,
@@ -52,6 +54,14 @@ pub const SavedContext = union(enum) {
         batch_size: u32,
         max_active: u32,
         out_features: u32,
+    };
+
+    pub const Concat = struct {
+        input_a: *Tensor,
+        input_b: *Tensor,
+        rows: u32,
+        cols_a: u32,
+        cols_b: u32,
     };
 };
 

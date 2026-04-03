@@ -145,6 +145,28 @@ pub fn sigmoid(self: *Graph, input: *Tensor) !*Tensor {
     return output;
 }
 
+/// Concatenate two tensors along the last axis: [rows, cols_a] ++ [rows, cols_b] -> [rows, cols_a + cols_b]
+pub fn concat(self: *Graph, a: *Tensor, b: *Tensor) !*Tensor {
+    const a_dims = a.shape.dims();
+    const b_dims = b.shape.dims();
+    const rows: u32 = @intCast(a_dims[0]);
+    std.debug.assert(rows == @as(u32, @intCast(b_dims[0])));
+    const cols_a: u32 = @intCast(a_dims[1]);
+    const cols_b: u32 = @intCast(b_dims[1]);
+
+    const out_cols: usize = @as(usize, cols_a) + @as(usize, cols_b);
+    const out_buf = try self.arena.alloc(@as(usize, rows) * out_cols);
+    try self.ops.concat(self.ctx, a.storage.gpu.buffer, b.storage.gpu.buffer, out_buf, rows, cols_a, cols_b);
+
+    var output = try self.createIntermediate(&.{ @as(usize, rows), out_cols }, out_buf);
+    output.tape_index = self.tape.entries.items.len;
+    try self.tape.append(.{
+        .saved = .{ .concat = .{ .input_a = a, .input_b = b, .rows = rows, .cols_a = cols_a, .cols_b = cols_b } },
+        .output = output,
+    });
+    return output;
+}
+
 /// out[b][j] = bias[j] + sum weights[active[b][i]][j]
 pub fn sparseAccumulate(
     self: *Graph,
@@ -236,6 +258,25 @@ fn backwardEntry(self: *Graph, entry: *const tape_mod.TapeEntry) !void {
                 try self.ops.sigmoidBackward(self.ctx, s.output.storage.gpu.buffer, grad_out, gi, s.n);
             }
         },
+        .concat => |s| {
+            const ga = if (needsGrad(s.input_a)) try self.ensureGrad(s.input_a) else null;
+            const gb = if (needsGrad(s.input_b)) try self.ensureGrad(s.input_b) else null;
+            if (ga != null or gb != null) {
+                // Both grad buffers must exist for the kernel (it writes to both).
+                // Use a temp zero buffer for the side that doesn't need grad.
+                const real_ga = ga orelse blk: {
+                    const tmp = try self.arena.alloc(@as(usize, s.rows) * @as(usize, s.cols_a));
+                    try self.ops.fill(self.ctx, tmp, 0.0);
+                    break :blk tmp;
+                };
+                const real_gb = gb orelse blk: {
+                    const tmp = try self.arena.alloc(@as(usize, s.rows) * @as(usize, s.cols_b));
+                    try self.ops.fill(self.ctx, tmp, 0.0);
+                    break :blk tmp;
+                };
+                try self.ops.concatBackward(self.ctx, grad_out, real_ga, real_gb, s.rows, s.cols_a, s.cols_b);
+            }
+        },
         .sparse_accumulate => |s| {
             if (s.weights.requires_grad) {
                 const gw = try self.ensureGrad(s.weights);
@@ -256,13 +297,7 @@ pub fn clipGradNorm(self: *Graph, params: []const *Tensor, max_norm: f32) !f32 {
 
     for (params) |p| {
         const g = p.grad orelse continue;
-        const n = g.elements();
-        const buf = try self.allocator.alloc(f32, n);
-        defer self.allocator.free(buf);
-        try g.storage.gpu.buffer.download(self.ctx, buf);
-        for (buf) |v| {
-            total += @as(f64, v) * @as(f64, v);
-        }
+        total += @as(f64, try self.ops.squaredSum(self.ctx, g.storage.gpu.buffer, self.allocator));
     }
 
     const global_norm: f32 = @floatCast(@sqrt(total));
@@ -700,6 +735,135 @@ test "numerical gradient check: matmul + sigmoid" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "numerical gradient check: concat + matmul" {
+    var ctx = try Context.init();
+    defer ctx.deinit();
+    var ops = try Ops.init(&ctx);
+    defer ops.deinit();
+    const allocator = std.testing.allocator;
+
+    const M: u32 = 2;
+    const Ca: u32 = 3;
+    const Cb: u32 = 2;
+    const N: u32 = 2;
+
+    var a_data = [_]f32{ 0.1, -0.2, 0.3, 0.4, 0.15, -0.1 };
+    var b_data = [_]f32{ 0.25, -0.35, 0.05, 0.45 };
+    var w_data = [_]f32{ 0.1, 0.2, -0.3, 0.4, 0.15, -0.25, -0.1, 0.35, 0.2, -0.15 };
+
+    // -- Analytical --
+    const a_buf = try Buffer.upload(&ctx, &a_data);
+    var input_a = makeTensor(allocator, &.{ M, Ca }, a_buf);
+    input_a.requires_grad = true;
+    defer input_a.deinit();
+
+    const b_buf = try Buffer.upload(&ctx, &b_data);
+    var input_b = makeTensor(allocator, &.{ M, Cb }, b_buf);
+    input_b.requires_grad = true;
+    defer input_b.deinit();
+
+    const w_buf = try Buffer.upload(&ctx, &w_data);
+    var weight = makeTensor(allocator, &.{ Ca + Cb, N }, w_buf);
+    weight.requires_grad = true;
+    defer weight.deinit();
+
+    var graph = Graph.init(allocator, &ctx, &ops);
+    defer graph.deinit();
+
+    const h1 = try graph.concat(&input_a, &input_b);
+    const h2 = try graph.matmul(h1, &weight);
+
+    try graph.setGrad(h2, 1.0);
+    try graph.backward(h2);
+
+    var a_grad: [M * Ca]f32 = undefined;
+    try input_a.grad.?.storage.gpu.buffer.download(&ctx, &a_grad);
+    var b_grad: [M * Cb]f32 = undefined;
+    try input_b.grad.?.storage.gpu.buffer.download(&ctx, &b_grad);
+    var w_grad: [(Ca + Cb) * N]f32 = undefined;
+    try weight.grad.?.storage.gpu.buffer.download(&ctx, &w_grad);
+
+    // -- Numerical --
+    const eps: f32 = 1e-3;
+    const tol: f32 = 2e-2;
+
+    for (0..M * Ca) |idx| {
+        const orig = a_data[idx];
+        a_data[idx] = orig + eps;
+        const lp = try computeConcatLoss(allocator, &ctx, &ops, &a_data, &b_data, &w_data, M, Ca, Cb, N);
+        a_data[idx] = orig - eps;
+        const lm = try computeConcatLoss(allocator, &ctx, &ops, &a_data, &b_data, &w_data, M, Ca, Cb, N);
+        a_data[idx] = orig;
+        const numerical = (lp - lm) / (2.0 * eps);
+        const err = relError(a_grad[idx], numerical);
+        if (err > tol) {
+            std.debug.print("concat input_a grad[{d}]: analytical={d:.6}, numerical={d:.6}, rel_err={d:.6}\n", .{ idx, a_grad[idx], numerical, err });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    for (0..M * Cb) |idx| {
+        const orig = b_data[idx];
+        b_data[idx] = orig + eps;
+        const lp = try computeConcatLoss(allocator, &ctx, &ops, &a_data, &b_data, &w_data, M, Ca, Cb, N);
+        b_data[idx] = orig - eps;
+        const lm = try computeConcatLoss(allocator, &ctx, &ops, &a_data, &b_data, &w_data, M, Ca, Cb, N);
+        b_data[idx] = orig;
+        const numerical = (lp - lm) / (2.0 * eps);
+        const err = relError(b_grad[idx], numerical);
+        if (err > tol) {
+            std.debug.print("concat input_b grad[{d}]: analytical={d:.6}, numerical={d:.6}, rel_err={d:.6}\n", .{ idx, b_grad[idx], numerical, err });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    for (0..(Ca + Cb) * N) |idx| {
+        const orig = w_data[idx];
+        w_data[idx] = orig + eps;
+        const lp = try computeConcatLoss(allocator, &ctx, &ops, &a_data, &b_data, &w_data, M, Ca, Cb, N);
+        w_data[idx] = orig - eps;
+        const lm = try computeConcatLoss(allocator, &ctx, &ops, &a_data, &b_data, &w_data, M, Ca, Cb, N);
+        w_data[idx] = orig;
+        const numerical = (lp - lm) / (2.0 * eps);
+        const err = relError(w_grad[idx], numerical);
+        if (err > tol) {
+            std.debug.print("concat weight grad[{d}]: analytical={d:.6}, numerical={d:.6}, rel_err={d:.6}\n", .{ idx, w_grad[idx], numerical, err });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn computeConcatLoss(
+    allocator: std.mem.Allocator,
+    ctx: *const Context,
+    ops: *const Ops,
+    a: []const f32,
+    b: []const f32,
+    w: []const f32,
+    m: u32,
+    cols_a: u32,
+    cols_b: u32,
+    n: u32,
+) !f32 {
+    var a_buf = try Buffer.upload(ctx, a);
+    defer a_buf.release();
+    var b_buf = try Buffer.upload(ctx, b);
+    defer b_buf.release();
+
+    const cols_out = cols_a + cols_b;
+    var cat_buf = try Buffer.alloc(ctx, @as(usize, m) * @as(usize, cols_out));
+    defer cat_buf.release();
+    try ops.concat(ctx, a_buf, b_buf, cat_buf, m, cols_a, cols_b);
+
+    var w_buf = try Buffer.upload(ctx, w);
+    defer w_buf.release();
+    var out_buf = try Buffer.alloc(ctx, @as(usize, m) * @as(usize, n));
+    defer out_buf.release();
+    try ops.matmul(ctx, cat_buf, w_buf, out_buf, m, n, cols_out);
+
+    return ops.reduceSum(ctx, out_buf, allocator);
 }
 
 fn computeSigmoidLoss(

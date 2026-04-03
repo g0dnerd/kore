@@ -13,6 +13,7 @@ pub const Metadata = struct {
     step: u32 = 0,
     learning_rate: f32 = 0,
     best_val_loss: f32 = 0,
+    adam_step: u32 = 0,
 };
 
 pub const NamedParam = struct {
@@ -229,11 +230,14 @@ test "checkpoint save and load round-trip" {
 
     // Save
     const path = "/tmp/kore_ml_test_ckpt.bin";
+    adam.step_count = 42;
+
     try save(allocator, &ctx, path, &named, &adam, .{
         .epoch = 5,
         .step = 1000,
         .learning_rate = 1e-3,
         .best_val_loss = 0.05,
+        .adam_step = adam.step_count,
     });
     var single_threaded: std.Io.Threaded = .init_single_threaded;
     const io = single_threaded.io();
@@ -285,6 +289,10 @@ test "checkpoint save and load round-trip" {
     try std.testing.expectEqual(@as(u32, 1000), meta.step);
     try std.testing.expectApproxEqAbs(@as(f32, 1e-3), meta.learning_rate, 1e-7);
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), meta.best_val_loss, 1e-7);
+    try std.testing.expectEqual(@as(u32, 42), meta.adam_step);
+
+    // Restore adam step_count from checkpoint
+    fresh_adam.step_count = meta.adam_step;
 
     // Verify weights
     var out_w: [6]f32 = undefined;

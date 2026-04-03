@@ -12,10 +12,12 @@ sigmoid_prog: Program,
 sparse_accumulate_prog: Program,
 concat_prog: Program,
 reduce_sum_prog: Program,
+squared_sum_prog: Program,
 fill_prog: Program,
 matmul_prog: Program,
 
 // Backward ops
+concat_backward_prog: Program,
 matmul_backward_input_prog: Program,
 matmul_backward_weight_prog: Program,
 add_bias_backward_prog: Program,
@@ -45,12 +47,16 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
     errdefer p_concat.release();
     var p_reduce = try Program.create(ctx, @embedFile("kernels/reduce_sum.cl"), "reduce_sum");
     errdefer p_reduce.release();
+    var p_sq_sum = try Program.create(ctx, @embedFile("kernels/squared_sum.cl"), "squared_sum");
+    errdefer p_sq_sum.release();
     var p_fill = try Program.create(ctx, @embedFile("kernels/fill.cl"), "fill");
     errdefer p_fill.release();
     var p_matmul = try Program.create(ctx, @embedFile("kernels/matmul.cl"), "matmul");
     errdefer p_matmul.release();
 
     // Backward
+    var p_concat_b = try Program.create(ctx, @embedFile("kernels/concat_backward.cl"), "concat_backward");
+    errdefer p_concat_b.release();
     var p_mm_bi = try Program.create(ctx, @embedFile("kernels/matmul_backward_input.cl"), "matmul_backward_input");
     errdefer p_mm_bi.release();
     var p_mm_bw = try Program.create(ctx, @embedFile("kernels/matmul_backward_weight.cl"), "matmul_backward_weight");
@@ -79,8 +85,10 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
         .sparse_accumulate_prog = p_sparse,
         .concat_prog = p_concat,
         .reduce_sum_prog = p_reduce,
+        .squared_sum_prog = p_sq_sum,
         .fill_prog = p_fill,
         .matmul_prog = p_matmul,
+        .concat_backward_prog = p_concat_b,
         .matmul_backward_input_prog = p_mm_bi,
         .matmul_backward_weight_prog = p_mm_bw,
         .add_bias_backward_prog = p_ab_b,
@@ -101,8 +109,10 @@ pub fn deinit(self: *Ops) void {
     self.sparse_accumulate_prog.release();
     self.concat_prog.release();
     self.reduce_sum_prog.release();
+    self.squared_sum_prog.release();
     self.fill_prog.release();
     self.matmul_prog.release();
+    self.concat_backward_prog.release();
     self.matmul_backward_input_prog.release();
     self.matmul_backward_weight_prog.release();
     self.add_bias_backward_prog.release();
@@ -199,6 +209,30 @@ pub fn concat(
     }, &.{ ts, ts });
 }
 
+/// Split gradient along last axis back to the two concat inputs.
+pub fn concatBackward(
+    self: *const Ops,
+    ctx: *const Context,
+    grad_output: Buffer,
+    grad_a: Buffer,
+    grad_b: Buffer,
+    rows: u32,
+    cols_a: u32,
+    cols_b: u32,
+) Context.Error!void {
+    try self.concat_backward_prog.setArg(0, grad_output);
+    try self.concat_backward_prog.setArg(1, grad_a);
+    try self.concat_backward_prog.setArg(2, grad_b);
+    try self.concat_backward_prog.setArg(3, rows);
+    try self.concat_backward_prog.setArg(4, cols_a);
+    try self.concat_backward_prog.setArg(5, cols_b);
+    const ts: usize = 16;
+    try self.concat_backward_prog.dispatch(ctx, &.{
+        roundUp(@as(usize, rows), ts),
+        roundUp(@as(usize, cols_a) + @as(usize, cols_b), ts),
+    }, &.{ ts, ts });
+}
+
 const reduce_wg_size: usize = 256;
 
 /// Sum all elements of a buffer. Returns scalar result.
@@ -216,6 +250,31 @@ pub fn reduceSum(self: *const Ops, ctx: *const Context, input: Buffer, allocator
     try self.reduce_sum_prog.setArgLocal(2, reduce_wg_size * @sizeOf(f32));
     try self.reduce_sum_prog.setArg(3, @as(u32, @intCast(n)));
     try self.reduce_sum_prog.dispatch(ctx, &.{global}, &.{reduce_wg_size});
+
+    const partials = try allocator.alloc(f32, num_groups);
+    defer allocator.free(partials);
+    try partial.download(ctx, partials);
+
+    var sum: f32 = 0;
+    for (partials) |v| sum += v;
+    return sum;
+}
+
+/// Sum of squared elements of a buffer. Returns scalar result.
+pub fn squaredSum(self: *const Ops, ctx: *const Context, input: Buffer, allocator: std.mem.Allocator) !f32 {
+    const n = input.len;
+    if (n == 0) return 0;
+    const global = roundUp(n, reduce_wg_size);
+    const num_groups = global / reduce_wg_size;
+
+    var partial = try Buffer.alloc(ctx, num_groups);
+    defer partial.release();
+
+    try self.squared_sum_prog.setArg(0, input);
+    try self.squared_sum_prog.setArg(1, partial);
+    try self.squared_sum_prog.setArgLocal(2, reduce_wg_size * @sizeOf(f32));
+    try self.squared_sum_prog.setArg(3, @as(u32, @intCast(n)));
+    try self.squared_sum_prog.dispatch(ctx, &.{global}, &.{reduce_wg_size});
 
     const partials = try allocator.alloc(f32, num_groups);
     defer allocator.free(partials);

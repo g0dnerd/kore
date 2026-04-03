@@ -72,6 +72,91 @@ pub fn sigmoid(comptime n: usize, input: *const [n]f32) [n]f32 {
     return out;
 }
 
+const vec_len_i16 = std.simd.suggestVectorLength(i16) orelse 8;
+const VecI16 = @Vector(vec_len_i16, i16);
+
+/// SIMD i16 vector add: acc[i] += row[i]
+pub fn addVec_i16(comptime n: usize, acc: *[n]i16, row: *const [n]i16) void {
+    const acc_s: []i16 = acc;
+    const row_s: []const i16 = row;
+
+    const full = (n / vec_len_i16) * vec_len_i16;
+    var i: usize = 0;
+    while (i < full) : (i += vec_len_i16) {
+        const va: VecI16 = acc_s[i..][0..vec_len_i16].*;
+        const vr: VecI16 = row_s[i..][0..vec_len_i16].*;
+        acc_s[i..][0..vec_len_i16].* = va + vr;
+    }
+    while (i < n) : (i += 1) {
+        acc_s[i] += row_s[i];
+    }
+}
+
+/// Clipped ReLU for i16: clamp(x, 0, 127) then truncate to i8.
+pub fn clippedRelu_i16(comptime n: usize, input: *const [n]i16) [n]i8 {
+    const zero: VecI16 = @splat(0);
+    const max_v: VecI16 = @splat(127);
+
+    var out: [n]i8 = undefined;
+    const in_s: []const i16 = input;
+    var out_s: []i8 = &out;
+
+    const full = (n / vec_len_i16) * vec_len_i16;
+    var i: usize = 0;
+    while (i < full) : (i += vec_len_i16) {
+        const v: VecI16 = in_s[i..][0..vec_len_i16].*;
+        const clamped: VecI16 = @intCast(@min(@max(v, zero), max_v));
+        const narrow: @Vector(vec_len_i16, i8) = @truncate(clamped);
+        out_s[i..][0..vec_len_i16].* = narrow;
+    }
+    while (i < n) : (i += 1) {
+        const clamped: i16 = @min(@max(in_s[i], @as(i16, 0)), @as(i16, 127));
+        out_s[i] = @truncate(clamped);
+    }
+    return out;
+}
+
+test "addVec_i16" {
+    var acc = [_]i16{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const row = [_]i16{ 10, 20, 30, 40, 50, 60, 70, 80 };
+    addVec_i16(8, &acc, &row);
+    const expected = [_]i16{ 11, 22, 33, 44, 55, 66, 77, 88 };
+    try std.testing.expectEqualSlices(i16, &expected, &acc);
+}
+
+test "addVec_i16 SIMD-aligned" {
+    var acc: [32]i16 = undefined;
+    var row: [32]i16 = undefined;
+    for (0..32) |i| {
+        acc[i] = @intCast(i);
+        row[i] = 1;
+    }
+    addVec_i16(32, &acc, &row);
+    for (0..32) |i| {
+        try std.testing.expectEqual(@as(i16, @intCast(i + 1)), acc[i]);
+    }
+}
+
+test "clippedRelu_i16" {
+    const input = [_]i16{ -100, -1, 0, 1, 64, 127, 128, 1000 };
+    const out = clippedRelu_i16(8, &input);
+    const expected = [_]i8{ 0, 0, 0, 1, 64, 127, 127, 127 };
+    try std.testing.expectEqualSlices(i8, &expected, &out);
+}
+
+test "clippedRelu_i16 SIMD-aligned" {
+    var input: [32]i16 = undefined;
+    for (0..32) |i| {
+        input[i] = @as(i16, @intCast(i)) * 10 - 100;
+    }
+    const out = clippedRelu_i16(32, &input);
+    for (0..32) |i| {
+        const v = @as(i16, @intCast(i)) * 10 - 100;
+        const expected: i8 = @intCast(@min(@max(v, 0), 127));
+        try std.testing.expectEqual(expected, out[i]);
+    }
+}
+
 test "dotProduct" {
     const a = [_]f32{ 1, 2, 3 };
     const b = [_]f32{ 4, 5, 6 };
