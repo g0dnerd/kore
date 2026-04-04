@@ -36,8 +36,6 @@ pub const cpu = struct {
     }
 };
 
-// ── Integration tests ───────────────────────────────────────────────
-
 fn uploadU32(ctx: *const gpu.Context, data: []const u32) gpu.Context.Error!gpu.Buffer {
     const cl = gpu.Context.cl;
     var err: cl.cl_int = undefined;
