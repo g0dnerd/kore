@@ -141,22 +141,19 @@ pub fn load(
         const p = params[idx];
         if (p.tensor.elements() != n) return error.ShapeMismatch;
 
-        const byte_len = n * @sizeOf(f32);
+        const dst = std.mem.sliceAsBytes(tmp[0..n]);
 
         // Weights
-        const w_bytes = try reader.take(byte_len);
-        @memcpy(std.mem.sliceAsBytes(tmp[0..n]), w_bytes);
+        try reader.readSliceAll(dst);
         try p.tensor.storage.gpu.buffer.write(ctx, tmp[0..n]);
 
         // Adam m
         const state = adam.getState(idx);
-        const m_bytes = try reader.take(byte_len);
-        @memcpy(std.mem.sliceAsBytes(tmp[0..n]), m_bytes);
+        try reader.readSliceAll(dst);
         try state.m.write(ctx, tmp[0..n]);
 
         // Adam v
-        const v_bytes = try reader.take(byte_len);
-        @memcpy(std.mem.sliceAsBytes(tmp[0..n]), v_bytes);
+        try reader.readSliceAll(dst);
         try state.v.write(ctx, tmp[0..n]);
     }
 
