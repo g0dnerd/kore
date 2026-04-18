@@ -92,6 +92,23 @@ pub fn addVec_i16(comptime n: usize, acc: *[n]i16, row: *const [n]i16) void {
     }
 }
 
+/// SIMD i16 vector subtract: acc[i] -= row[i]
+pub fn subVec_i16(comptime n: usize, acc: *[n]i16, row: *const [n]i16) void {
+    const acc_s: []i16 = acc;
+    const row_s: []const i16 = row;
+
+    const full = (n / vec_len_i16) * vec_len_i16;
+    var i: usize = 0;
+    while (i < full) : (i += vec_len_i16) {
+        const va: VecI16 = acc_s[i..][0..vec_len_i16].*;
+        const vr: VecI16 = row_s[i..][0..vec_len_i16].*;
+        acc_s[i..][0..vec_len_i16].* = va - vr;
+    }
+    while (i < n) : (i += 1) {
+        acc_s[i] -= row_s[i];
+    }
+}
+
 /// Clipped ReLU for i16: clamp(x, 0, 127) then truncate to i8.
 pub fn clippedRelu_i16(comptime n: usize, input: *const [n]i16) [n]i8 {
     const zero: VecI16 = @splat(0);

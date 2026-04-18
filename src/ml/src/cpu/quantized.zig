@@ -27,7 +27,9 @@ pub fn dequantize(comptime T: type, comptime n: usize, input: *const [n]T, scale
 
 /// Quantized matrix multiply with i32 accumulation.
 /// A[M,K] @ B[K,N] -> C[M,N]
-/// Loop order (i,k,j) for cache-friendly sequential access on B and C.
+/// Loop order (i,k,j): the inner j-loop is SIMD-vectorized when N is a
+/// multiple of the platform i32 vector width, which it is for the typical
+/// NNUE shapes (N=32). Falls back to scalar otherwise.
 pub fn matmul(
     comptime T: type,
     comptime M: usize,
@@ -37,6 +39,35 @@ pub fn matmul(
     b: *const [K * N]T,
 ) [M * N]i32 {
     var out: [M * N]i32 = [_]i32{0} ** (M * N);
+
+    const lanes = comptime std.simd.suggestVectorLength(i32) orelse 1;
+    if (comptime lanes > 1 and N % lanes == 0) {
+        const VecAcc = @Vector(lanes, i32);
+        const VecT = @Vector(lanes, T);
+        const groups = N / lanes;
+
+        for (0..M) |i| {
+            var acc: [groups]VecAcc = undefined;
+            inline for (0..groups) |g| acc[g] = @splat(0);
+
+            for (0..K) |k| {
+                const a_val: i32 = @intCast(a.*[i * K + k]);
+                const av: VecAcc = @splat(a_val);
+                const b_row_off = k * N;
+                inline for (0..groups) |g| {
+                    const b_chunk: VecT = b.*[b_row_off + g * lanes ..][0..lanes].*;
+                    const b_wide: VecAcc = b_chunk;
+                    acc[g] += av * b_wide;
+                }
+            }
+
+            inline for (0..groups) |g| {
+                out[i * N + g * lanes ..][0..lanes].* = acc[g];
+            }
+        }
+        return out;
+    }
+
     for (0..M) |i| {
         for (0..K) |k| {
             const a_val: i32 = @intCast(a.*[i * K + k]);
