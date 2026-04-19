@@ -80,6 +80,60 @@ pub fn matmul(
     return out;
 }
 
+const vec_len_i8 = std.simd.suggestVectorLength(i8) orelse 16;
+const VecI8 = @Vector(vec_len_i8, i8);
+const VecI16w = @Vector(vec_len_i8, i16);
+const VecI32w = @Vector(vec_len_i8, i32);
+
+/// SIMD i8 dot product with i32 accumulation.
+/// Sign-extends i8 -> i16 -> i32 lane-wise; LLVM lowers the paired
+/// (sext i16) * (sext i16) -> i32 pattern to vpmaddwd on AVX2 and smlal on NEON.
+pub fn dotProduct_i8(comptime n: usize, a: *const [n]i8, b: *const [n]i8) i32 {
+    const a_s: []const i8 = a;
+    const b_s: []const i8 = b;
+
+    var acc: VecI32w = @splat(0);
+    const full = (n / vec_len_i8) * vec_len_i8;
+
+    var i: usize = 0;
+    while (i < full) : (i += vec_len_i8) {
+        const va_i8: VecI8 = a_s[i..][0..vec_len_i8].*;
+        const vb_i8: VecI8 = b_s[i..][0..vec_len_i8].*;
+        const va_i16: VecI16w = @intCast(va_i8);
+        const vb_i16: VecI16w = @intCast(vb_i8);
+        const va_i32: VecI32w = @intCast(va_i16);
+        const vb_i32: VecI32w = @intCast(vb_i16);
+        acc += va_i32 * vb_i32;
+    }
+
+    var sum: i32 = @reduce(.Add, acc);
+    while (i < n) : (i += 1) {
+        const av: i32 = @intCast(a_s[i]);
+        const bv: i32 = @intCast(b_s[i]);
+        sum += av * bv;
+    }
+    return sum;
+}
+
+/// i8 linear forward with i32 accumulation — the NNUE FC1/FC2 kernel.
+/// out[j] = bias[j] + sum_k(input[k] * weight[j * in_features + k])
+/// Weight layout: row-major [out_features, in_features] so each row is contiguous
+/// along the reduction dimension.
+pub fn linearForward_i8(
+    comptime in_features: usize,
+    comptime out_features: usize,
+    input: *const [in_features]i8,
+    weight: *const [out_features * in_features]i8,
+    bias: *const [out_features]i32,
+) [out_features]i32 {
+    var output: [out_features]i32 = bias.*;
+    const w: []const i8 = weight;
+    for (0..out_features) |j| {
+        output[j] += dotProduct_i8(in_features, input, w[j * in_features ..][0..in_features]);
+    }
+    return output;
+}
+
 test "quantize and dequantize i8 round-trip" {
     const input = [_]f32{ 1.0, -0.5, 0.25, 0.0 };
     const scale: f32 = 127.0;
@@ -143,6 +197,75 @@ test "matmul i8" {
     try std.testing.expectEqual(@as(i32, 64), c[1]);
     try std.testing.expectEqual(@as(i32, 139), c[2]);
     try std.testing.expectEqual(@as(i32, 154), c[3]);
+}
+
+test "dotProduct_i8 small" {
+    const a = [_]i8{ 1, 2, 3 };
+    const b = [_]i8{ 4, 5, 6 };
+    try std.testing.expectEqual(@as(i32, 32), dotProduct_i8(3, &a, &b));
+}
+
+test "dotProduct_i8 SIMD-aligned" {
+    var a: [64]i8 = undefined;
+    var b: [64]i8 = undefined;
+    for (0..64) |i| {
+        a[i] = @intCast(@mod(i, 16));
+        b[i] = 1;
+    }
+    // (0+1+...+15) repeated 4 times = 120 * 4 = 480
+    try std.testing.expectEqual(@as(i32, 480), dotProduct_i8(64, &a, &b));
+}
+
+test "dotProduct_i8 saturated lanes" {
+    // Exercises the full i8 range; verifies i16 intermediate doesn't overflow.
+    const a = [_]i8{ 127, -128, 127, -128 };
+    const b = [_]i8{ 127, -128, -128, 127 };
+    // 127*127 + 128*128 - 127*128 - 128*127 = 16129 + 16384 - 16256 - 16256 = 1
+    try std.testing.expectEqual(@as(i32, 1), dotProduct_i8(4, &a, &b));
+}
+
+test "dotProduct_i8 matches scalar matmul" {
+    const a = [_]i8{ 3, -7, 11, -2, 5, 120, -64, 8, 1, -1, 42, 0, -9, 17, 33, -50 };
+    const b = [_]i8{ -4, 9, 2, 8, -11, 3, 13, -6, 22, -17, 50, -25, 0, 1, -1, 127 };
+    // Compare against the existing generic matmul with M=N=1, K=16.
+    const ref = matmul(i8, 1, 16, 1, &a, &b);
+    try std.testing.expectEqual(ref[0], dotProduct_i8(16, &a, &b));
+}
+
+test "linearForward_i8 hand-computed" {
+    const input = [_]i8{ 1, 2, 3 };
+    // weight row 0 = [1,2,3], row 1 = [4,5,6]
+    const weight = [_]i8{ 1, 2, 3, 4, 5, 6 };
+    const bias = [_]i32{ 100, -50 };
+    // out[0] = 100 + 1 + 4 + 9 = 114
+    // out[1] = -50 + 4 + 10 + 18 = -18
+    const out = linearForward_i8(3, 2, &input, &weight, &bias);
+    try std.testing.expectEqual(@as(i32, 114), out[0]);
+    try std.testing.expectEqual(@as(i32, -18), out[1]);
+}
+
+test "linearForward_i8 SIMD-aligned shape" {
+    // Shape representative of NNUE FC1: 32 -> 16
+    var input: [32]i8 = undefined;
+    var weight: [16 * 32]i8 = undefined;
+    var bias: [16]i32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rng = prng.random();
+    for (0..32) |i| input[i] = rng.intRangeAtMost(i8, -128, 127);
+    for (0..16 * 32) |i| weight[i] = rng.intRangeAtMost(i8, -128, 127);
+    for (0..16) |i| bias[i] = rng.intRangeAtMost(i32, -1000, 1000);
+
+    const got = linearForward_i8(32, 16, &input, &weight, &bias);
+
+    // Reference via scalar matmul: (1x32) @ (32x16) needs weight transposed.
+    var weight_t: [32 * 16]i8 = undefined;
+    for (0..16) |j| for (0..32) |k| {
+        weight_t[k * 16 + j] = weight[j * 32 + k];
+    };
+    const ref = matmul(i8, 1, 32, 16, &input, &weight_t);
+    for (0..16) |j| {
+        try std.testing.expectEqual(bias[j] + ref[j], got[j]);
+    }
 }
 
 test "matmul i16" {
