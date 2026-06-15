@@ -134,6 +134,46 @@ pub fn linearForward_i8(
     return output;
 }
 
+const vec_len_i32 = std.simd.suggestVectorLength(i32) orelse 4;
+const VecI32 = @Vector(vec_len_i32, i32);
+const VecI32_i8 = @Vector(vec_len_i32, i8);
+const VecShift = @Vector(vec_len_i32, u5);
+
+/// Fused post-FC activation: out[i] = clamp(input[i] >> shift, 0, 127) narrowed to i8.
+/// Replaces the two-step (scale to i16, then clippedRelu to i8) used after each
+/// quantized FC layer in NNUE inference. Equivalent to clamp(@divTrunc(x, 2^shift), 0, 127)
+/// as i8 for this clamp range: negative values always clamp to 0 regardless of whether
+/// `>>` or `@divTrunc` is used, so `>>` is safe and avoids the compensated-divide sequence.
+pub fn shiftClippedRelu_i8(
+    comptime n: usize,
+    comptime shift: u5,
+    input: *const [n]i32,
+) [n]i8 {
+    var out: [n]i8 = undefined;
+    const in_s: []const i32 = input;
+    var out_s: []i8 = &out;
+
+    const zero: VecI32 = @splat(0);
+    const max_v: VecI32 = @splat(127);
+    const shift_v: VecShift = @splat(shift);
+
+    const full = (n / vec_len_i32) * vec_len_i32;
+    var i: usize = 0;
+    while (i < full) : (i += vec_len_i32) {
+        const v: VecI32 = in_s[i..][0..vec_len_i32].*;
+        const shifted: VecI32 = v >> shift_v;
+        const clamped: VecI32 = @min(@max(shifted, zero), max_v);
+        const narrow: VecI32_i8 = @intCast(clamped);
+        out_s[i..][0..vec_len_i32].* = narrow;
+    }
+    while (i < n) : (i += 1) {
+        const shifted = in_s[i] >> shift;
+        const clamped = @min(@max(shifted, @as(i32, 0)), @as(i32, 127));
+        out_s[i] = @intCast(clamped);
+    }
+    return out;
+}
+
 test "quantize and dequantize i8 round-trip" {
     const input = [_]f32{ 1.0, -0.5, 0.25, 0.0 };
     const scale: f32 = 127.0;
@@ -265,6 +305,44 @@ test "linearForward_i8 SIMD-aligned shape" {
     const ref = matmul(i8, 1, 32, 16, &input, &weight_t);
     for (0..16) |j| {
         try std.testing.expectEqual(bias[j] + ref[j], got[j]);
+    }
+}
+
+test "shiftClippedRelu_i8 matches reference clamp" {
+    // Cover: negative values, values <127 after shift, values >127 after shift,
+    // and an odd tail-element count (33 not a multiple of typical i32 vec widths).
+    const n = 33;
+    var input: [n]i32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xDEADBEEF);
+    const rng = prng.random();
+    for (0..n) |i| input[i] = rng.intRangeAtMost(i32, -100_000, 100_000);
+
+    const got = shiftClippedRelu_i8(n, 6, &input);
+
+    for (0..n) |i| {
+        const shifted = input[i] >> 6;
+        const expected_i32 = @min(@max(shifted, @as(i32, 0)), @as(i32, 127));
+        const expected: i8 = @intCast(expected_i32);
+        try std.testing.expectEqual(expected, got[i]);
+    }
+}
+
+test "shiftClippedRelu_i8 equivalent to divTrunc+clamp for clamp range" {
+    // Proves the shift-vs-divTrunc substitution is safe for the [0,127] clamp:
+    // negatives produce 0 in both paths; positives are identical.
+    const n = 32;
+    var input: [n]i32 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xFEEDFACE);
+    const rng = prng.random();
+    for (0..n) |i| input[i] = rng.intRangeAtMost(i32, -1_000_000, 1_000_000);
+
+    const got = shiftClippedRelu_i8(n, 6, &input);
+
+    for (0..n) |i| {
+        const via_div = @divTrunc(input[i], 64);
+        const expected_i32 = @min(@max(via_div, @as(i32, 0)), @as(i32, 127));
+        const expected: i8 = @intCast(expected_i32);
+        try std.testing.expectEqual(expected, got[i]);
     }
 }
 
