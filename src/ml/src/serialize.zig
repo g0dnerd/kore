@@ -21,14 +21,35 @@ pub const NamedParam = struct {
     tensor: *Tensor,
 };
 
+// Maps a global parameter index to its optimizer state when params are spread
+// across multiple optimizers (e.g. separate Adam instances for FT vs dense
+// layers with different weight decay). The optimizers must cover params in
+// order; total state count is validated against params.len by the caller.
+fn resolveState(adams: []const *const Adam, global_idx: usize) Adam.ParamState {
+    var gi = global_idx;
+    for (adams) |a| {
+        if (gi < a.states.len) return a.getState(gi);
+        gi -= a.states.len;
+    }
+    unreachable;
+}
+
+fn assertOptimizerCoverage(adams: []const *const Adam, num_params: usize) !void {
+    var total_states: usize = 0;
+    for (adams) |a| total_states += a.states.len;
+    if (total_states != num_params) return error.OptimizerParamMismatch;
+}
+
 pub fn save(
     allocator: std.mem.Allocator,
     ctx: *const Context,
     path: []const u8,
     params: []const NamedParam,
-    adam: *const Adam,
+    adams: []const *const Adam,
     metadata: Metadata,
 ) !void {
+    try assertOptimizerCoverage(adams, params.len);
+
     // Pre-serialize metadata JSON to know its length for the header
     var json_buf: [512]u8 = undefined;
     var json_w = std.Io.Writer.fixed(&json_buf);
@@ -75,7 +96,7 @@ pub fn save(
         try writer.writeAll(std.mem.sliceAsBytes(tmp[0..n]));
 
         // Adam first moment (m)
-        const state = adam.getState(i);
+        const state = resolveState(adams, i);
         try state.m.download(ctx, tmp[0..n]);
         try writer.writeAll(std.mem.sliceAsBytes(tmp[0..n]));
 
@@ -92,8 +113,10 @@ pub fn load(
     ctx: *const Context,
     path: []const u8,
     params: []const NamedParam,
-    adam: *Adam,
+    adams: []const *const Adam,
 ) !Metadata {
+    try assertOptimizerCoverage(adams, params.len);
+
     var single_threaded: std.Io.Threaded = .init_single_threaded;
     const io = single_threaded.io();
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});
@@ -148,7 +171,7 @@ pub fn load(
         try p.tensor.storage.gpu.buffer.write(ctx, tmp[0..n]);
 
         // Adam m
-        const state = adam.getState(idx);
+        const state = resolveState(adams, idx);
         try reader.readSliceAll(dst);
         try state.m.write(ctx, tmp[0..n]);
 
@@ -229,7 +252,7 @@ test "checkpoint save and load round-trip" {
     const path = "/tmp/kore_ml_test_ckpt.bin";
     adam.step_count = 42;
 
-    try save(allocator, &ctx, path, &named, &adam, .{
+    try save(allocator, &ctx, path, &named, &.{&adam}, .{
         .epoch = 5,
         .step = 1000,
         .learning_rate = 1e-3,
@@ -279,7 +302,7 @@ test "checkpoint save and load round-trip" {
     };
 
     // Load
-    const meta = try load(allocator, &ctx, path, &fresh_named, &fresh_adam);
+    const meta = try load(allocator, &ctx, path, &fresh_named, &.{&fresh_adam});
 
     // Verify metadata
     try std.testing.expectEqual(@as(u32, 5), meta.epoch);
@@ -316,5 +339,137 @@ test "checkpoint save and load round-trip" {
 
     var out_v_b: [2]f32 = undefined;
     try fresh_adam.getState(1).v.download(&ctx, &out_v_b);
+    try std.testing.expectEqualSlices(f32, &v_b, &out_v_b);
+}
+
+test "checkpoint round-trip with split optimizers" {
+    // Regression: params spread across two Adam instances (as the NNUE trainer
+    // does for FT vs dense layers). Previously save/load indexed a single adam
+    // for every param, reading past its state array -> CL_INVALID_MEM_OBJECT.
+    const allocator = std.testing.allocator;
+    var ctx = try Context.init();
+    defer ctx.deinit();
+    const Ops = @import("gpu/ops.zig");
+    var ops_ = try Ops.init(&ctx);
+    defer ops_.deinit();
+
+    const w_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const b_data = [_]f32{ 5.0, 6.0 };
+
+    const weight = try allocator.create(Tensor);
+    weight.* = .{
+        .shape = Shape.init(&.{ 2, 2 }),
+        .storage = .{ .gpu = .{ .buffer = try Buffer.upload(&ctx, &w_data) } },
+        .requires_grad = true,
+        .allocator = allocator,
+    };
+    defer {
+        weight.deinit();
+        allocator.destroy(weight);
+    }
+
+    const bias = try allocator.create(Tensor);
+    bias.* = .{
+        .shape = Shape.init(&.{2}),
+        .storage = .{ .gpu = .{ .buffer = try Buffer.upload(&ctx, &b_data) } },
+        .requires_grad = true,
+        .allocator = allocator,
+    };
+    defer {
+        bias.deinit();
+        allocator.destroy(bias);
+    }
+
+    // Two separate optimizers, one param each.
+    const w_params = [_]*Tensor{weight};
+    const b_params = [_]*Tensor{bias};
+    var adam_w = try Adam.init(allocator, &ctx, &ops_, &w_params, .{ .lr = 1e-3 });
+    defer adam_w.deinit();
+    var adam_b = try Adam.init(allocator, &ctx, &ops_, &b_params, .{ .lr = 1e-3, .weight_decay = 0.01 });
+    defer adam_b.deinit();
+
+    const m_w = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    const v_w = [_]f32{ 0.01, 0.02, 0.03, 0.04 };
+    const m_b = [_]f32{ 0.5, 0.6 };
+    const v_b = [_]f32{ 0.05, 0.06 };
+    try adam_w.getState(0).m.write(&ctx, &m_w);
+    try adam_w.getState(0).v.write(&ctx, &v_w);
+    try adam_b.getState(0).m.write(&ctx, &m_b);
+    try adam_b.getState(0).v.write(&ctx, &v_b);
+
+    const named = [_]NamedParam{
+        .{ .name = "ft.weight", .tensor = weight },
+        .{ .name = "ft.bias", .tensor = bias },
+    };
+
+    const path = "/tmp/kore_ml_test_ckpt_split.bin";
+    try save(allocator, &ctx, path, &named, &.{ &adam_w, &adam_b }, .{ .epoch = 3 });
+    var single_threaded: std.Io.Threaded = .init_single_threaded;
+    const io = single_threaded.io();
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // Mismatched coverage must be rejected, not silently OOB.
+    try std.testing.expectError(
+        error.OptimizerParamMismatch,
+        load(allocator, &ctx, path, &named, &.{&adam_w}),
+    );
+
+    // Fresh, zeroed params + optimizers.
+    const fw_buf = try Buffer.alloc(&ctx, 4);
+    try ops_.fill(&ctx, fw_buf, 0.0);
+    const fresh_w = try allocator.create(Tensor);
+    fresh_w.* = .{
+        .shape = Shape.init(&.{ 2, 2 }),
+        .storage = .{ .gpu = .{ .buffer = fw_buf } },
+        .requires_grad = true,
+        .allocator = allocator,
+    };
+    defer {
+        fresh_w.deinit();
+        allocator.destroy(fresh_w);
+    }
+    const fb_buf = try Buffer.alloc(&ctx, 2);
+    try ops_.fill(&ctx, fb_buf, 0.0);
+    const fresh_b = try allocator.create(Tensor);
+    fresh_b.* = .{
+        .shape = Shape.init(&.{2}),
+        .storage = .{ .gpu = .{ .buffer = fb_buf } },
+        .requires_grad = true,
+        .allocator = allocator,
+    };
+    defer {
+        fresh_b.deinit();
+        allocator.destroy(fresh_b);
+    }
+
+    const fresh_w_params = [_]*Tensor{fresh_w};
+    const fresh_b_params = [_]*Tensor{fresh_b};
+    var fresh_adam_w = try Adam.init(allocator, &ctx, &ops_, &fresh_w_params, .{ .lr = 1e-3 });
+    defer fresh_adam_w.deinit();
+    var fresh_adam_b = try Adam.init(allocator, &ctx, &ops_, &fresh_b_params, .{ .lr = 1e-3, .weight_decay = 0.01 });
+    defer fresh_adam_b.deinit();
+
+    const fresh_named = [_]NamedParam{
+        .{ .name = "ft.weight", .tensor = fresh_w },
+        .{ .name = "ft.bias", .tensor = fresh_b },
+    };
+
+    const meta = try load(allocator, &ctx, path, &fresh_named, &.{ &fresh_adam_w, &fresh_adam_b });
+    try std.testing.expectEqual(@as(u32, 3), meta.epoch);
+
+    // Weights round-trip.
+    var out_w: [4]f32 = undefined;
+    try fresh_w.storage.gpu.buffer.download(&ctx, &out_w);
+    try std.testing.expectEqualSlices(f32, &w_data, &out_w);
+    var out_b: [2]f32 = undefined;
+    try fresh_b.storage.gpu.buffer.download(&ctx, &out_b);
+    try std.testing.expectEqualSlices(f32, &b_data, &out_b);
+
+    // Adam state from the SECOND optimizer round-trips (the param that used to OOB).
+    var out_m_b: [2]f32 = undefined;
+    try fresh_adam_b.getState(0).m.download(&ctx, &out_m_b);
+    try std.testing.expectEqualSlices(f32, &m_b, &out_m_b);
+    var out_v_b: [2]f32 = undefined;
+    try fresh_adam_b.getState(0).v.download(&ctx, &out_v_b);
     try std.testing.expectEqualSlices(f32, &v_b, &out_v_b);
 }

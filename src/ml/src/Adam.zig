@@ -14,7 +14,7 @@ pub const Config = struct {
     weight_decay: f32 = 0,
 };
 
-const ParamState = struct {
+pub const ParamState = struct {
     m: Buffer,
     v: Buffer,
     n: u32,
@@ -90,6 +90,7 @@ pub fn step(self: *Adam, params: []const *Tensor) !void {
 
 /// Get first moment (m) and second moment (v) buffers for serialization.
 pub fn getState(self: *const Adam, index: usize) ParamState {
+    std.debug.assert(index < self.states.len);
     return self.states[index];
 }
 
