@@ -28,6 +28,7 @@ weighted_add_prog: Program,
 
 // Loss & optimizer
 mse_loss_prog: Program,
+mse_loss_bucketed_prog: Program,
 adam_update_prog: Program,
 
 // Quantization
@@ -73,6 +74,8 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
     errdefer p_wa.release();
     var p_mse = try Program.create(ctx, @embedFile("kernels/mse_loss.cl"), "mse_loss");
     errdefer p_mse.release();
+    var p_mse_bucketed = try Program.create(ctx, @embedFile("kernels/mse_loss_bucketed.cl"), "mse_loss_bucketed");
+    errdefer p_mse_bucketed.release();
     var p_adam = try Program.create(ctx, @embedFile("kernels/adam_update.cl"), "adam_update");
     errdefer p_adam.release();
     var p_quant_i8 = try Program.create(ctx, @embedFile("kernels/quantize.cl"), "quantize_i8");
@@ -97,6 +100,7 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
         .sparse_accumulate_backward_prog = p_sp_b,
         .weighted_add_prog = p_wa,
         .mse_loss_prog = p_mse,
+        .mse_loss_bucketed_prog = p_mse_bucketed,
         .adam_update_prog = p_adam,
         .quantize_i8_prog = p_quant_i8,
     };
@@ -121,6 +125,7 @@ pub fn deinit(self: *Ops) void {
     self.sparse_accumulate_backward_prog.release();
     self.weighted_add_prog.release();
     self.mse_loss_prog.release();
+    self.mse_loss_bucketed_prog.release();
     self.adam_update_prog.release();
     self.quantize_i8_prog.release();
     self.* = undefined;
@@ -475,6 +480,34 @@ pub fn mseLoss(
     try self.mse_loss_prog.dispatch(ctx, &.{@as(usize, n)}, null);
 }
 
+/// Bucketed MSE loss over a [batch, num_buckets] prediction tensor. Only the
+/// column selected by bucket[b] contributes; non-selected columns are zeroed in
+/// both element_loss and grad. `total` == batch*num_buckets, `inv_n` == 1/batch.
+pub fn mseLossBucketed(
+    self: *const Ops,
+    ctx: *const Context,
+    pred: Buffer,
+    target: Buffer,
+    bucket: Buffer,
+    element_loss: Buffer,
+    grad: Buffer,
+    total: u32,
+    num_buckets: u32,
+    scale: f32,
+    inv_n: f32,
+) Context.Error!void {
+    try self.mse_loss_bucketed_prog.setArg(0, pred);
+    try self.mse_loss_bucketed_prog.setArg(1, target);
+    try self.mse_loss_bucketed_prog.setArg(2, bucket);
+    try self.mse_loss_bucketed_prog.setArg(3, element_loss);
+    try self.mse_loss_bucketed_prog.setArg(4, grad);
+    try self.mse_loss_bucketed_prog.setArg(5, total);
+    try self.mse_loss_bucketed_prog.setArg(6, num_buckets);
+    try self.mse_loss_bucketed_prog.setArg(7, scale);
+    try self.mse_loss_bucketed_prog.setArg(8, inv_n);
+    try self.mse_loss_bucketed_prog.dispatch(ctx, &.{@as(usize, total)}, null);
+}
+
 /// In-place Adam parameter update.
 pub fn adamUpdate(
     self: *const Ops,
@@ -698,6 +731,70 @@ test "concat: GPU matches CPU" {
     for (0..10) |i| {
         try std.testing.expectApproxEqAbs(expected[i], result[i], 1e-6);
     }
+}
+
+test "mse_loss_bucketed: selected column only" {
+    var ctx = try Context.init();
+    defer ctx.deinit();
+    var ops = try Ops.init(&ctx);
+    defer ops.deinit();
+
+    const batch: u32 = 3;
+    const num_buckets: u32 = 4;
+    const total: u32 = batch * num_buckets;
+    const inv_n: f32 = 1.0 / @as(f32, @floatFromInt(batch));
+
+    // Row-major [batch][num_buckets] predictions; scale=0 → identity (no sigmoid)
+    // so the loss/grad have a clean closed form.
+    const pred = [_]f32{
+        0.1, 0.2,  0.3, 0.4, // row 0, bucket 1 selected → 0.2
+        1.0, 2.0,  3.0, 4.0, // row 1, bucket 3 selected → 4.0
+        -1.0, 0.5, 0.0, 2.0, // row 2, bucket 0 selected → -1.0
+    };
+    const target = [_]f32{ 0.5, 0.0, 1.0 };
+    const bucket = [_]u32{ 1, 3, 0 };
+
+    var pred_buf = try Buffer.upload(&ctx, &pred);
+    defer pred_buf.release();
+    var target_buf = try Buffer.upload(&ctx, &target);
+    defer target_buf.release();
+    var bucket_buf = try uploadU32(&ctx, &bucket);
+    defer bucket_buf.release();
+    var elem_buf = try Buffer.alloc(&ctx, total);
+    defer elem_buf.release();
+    var grad_buf = try Buffer.alloc(&ctx, total);
+    defer grad_buf.release();
+
+    try ops.mseLossBucketed(&ctx, pred_buf, target_buf, bucket_buf, elem_buf, grad_buf, total, num_buckets, 0.0, inv_n);
+
+    var elem: [12]f32 = undefined;
+    try elem_buf.download(&ctx, &elem);
+    var grad: [12]f32 = undefined;
+    try grad_buf.download(&ctx, &grad);
+
+    // diffs at the selected columns: -0.3, 4.0, -2.0.
+    const sel = [_]usize{ 0 * num_buckets + 1, 1 * num_buckets + 3, 2 * num_buckets + 0 };
+    const diff = [_]f32{ -0.3, 4.0, -2.0 };
+
+    // Every non-selected entry must be exactly zero (loss and grad).
+    for (0..total) |i| {
+        const is_sel = i == sel[0] or i == sel[1] or i == sel[2];
+        if (!is_sel) {
+            try std.testing.expectEqual(@as(f32, 0), elem[i]);
+            try std.testing.expectEqual(@as(f32, 0), grad[i]);
+        }
+    }
+
+    // Selected entries: element_loss = diff², grad = 2·inv_n·diff.
+    for (0..3) |k| {
+        try std.testing.expectApproxEqAbs(diff[k] * diff[k], elem[sel[k]], 1e-5);
+        try std.testing.expectApproxEqAbs(2.0 * inv_n * diff[k], grad[sel[k]], 1e-5);
+    }
+
+    // Reduced scalar loss matches MseLoss.forward semantics (mean over batch).
+    const loss_sum = try ops.reduceSum(&ctx, elem_buf, std.testing.allocator);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.09 + 16.0 + 4.0), loss_sum, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, (0.09 + 16.0 + 4.0) / 3.0), loss_sum * inv_n, 1e-4);
 }
 
 test "reduce_sum: GPU matches CPU" {
