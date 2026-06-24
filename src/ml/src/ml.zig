@@ -9,6 +9,7 @@ pub const Graph = @import("Graph.zig");
 pub const Linear = @import("Linear.zig");
 pub const SparseLinear = @import("SparseLinear.zig");
 pub const ClippedReLU = @import("ClippedReLU.zig");
+pub const SquaredClippedReLU = @import("SquaredClippedReLU.zig");
 pub const Layer = @import("Layer.zig");
 pub const Sequential = @import("Sequential.zig");
 pub const MseLoss = @import("MseLoss.zig");

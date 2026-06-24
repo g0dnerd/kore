@@ -133,6 +133,31 @@ pub fn clippedRelu_i16(comptime n: usize, input: *const [n]i16) [n]i8 {
     return out;
 }
 
+// Squared clipped ReLU for the NNUE feature-transformer output (SCReLU). The
+// hidden layers keep plain clippedRelu_i16. Must stay in lockstep with the FT
+// quantization in the .nnue exporter (FT weights/biases ×127).
+//
+// Quant scheme:
+//   - FT weights/biases ×127 → the accumulator `input` holds the activation x at
+//     scale 127 (float 1.0 ≡ 127).
+//   - q = clamp(input, 0, 127) ∈ [0,127]   ( == clamp(x,0,1)·127 )
+//   - SCReLU output a = clamp(x,0,1)² = (q/127)². It is delivered to FC1 at the
+//     SAME scale 127 that FC1 already assumes (fc1 biases ×127·64, >>6 dequant),
+//     so a_i8 = round(a·127) = round(q²/127) ∈ [0,127]. Nothing downstream of the
+//     FT changes; only this activation differs from the CReLU path.
+//   - q² ≤ 127² = 16129 fits i32; the ÷127 runs once per FT output element (not in
+//     the per-weight matmul loop), so a non-power-of-2 divisor is fine here.
+pub fn squaredClippedRelu_i16(comptime n: usize, input: *const [n]i16) [n]i8 {
+    var out: [n]i8 = undefined;
+    for (0..n) |i| {
+        const q: i32 = @min(@max(@as(i32, input[i]), 0), 127);
+        // round(q² / 127); q² + 63 rounds to nearest. Max (16129+63)/127 = 127.
+        const a: i32 = @divTrunc(q * q + 63, 127);
+        out[i] = @intCast(a);
+    }
+    return out;
+}
+
 test "addVec_i16" {
     var acc = [_]i16{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const row = [_]i16{ 10, 20, 30, 40, 50, 60, 70, 80 };
@@ -172,6 +197,15 @@ test "clippedRelu_i16 SIMD-aligned" {
         const expected: i8 = @intCast(@min(@max(v, 0), 127));
         try std.testing.expectEqual(expected, out[i]);
     }
+}
+
+test "squaredClippedRelu_i16" {
+    // q=clamp(x,0,127); out=round(q²/127). e.g. 64→round(4096/127)=32,
+    // 90→round(8100/127)=64, 127→round(16129/127)=127, >127 clamps to 127.
+    const input = [_]i16{ -100, 0, 64, 90, 127, 128, 1000 };
+    const out = squaredClippedRelu_i16(7, &input);
+    const expected = [_]i8{ 0, 0, 32, 64, 127, 127, 127 };
+    try std.testing.expectEqualSlices(i8, &expected, &out);
 }
 
 test "dotProduct" {

@@ -130,6 +130,21 @@ pub fn clippedRelu(self: *Graph, input: *Tensor, max_val: f32) !*Tensor {
     return output;
 }
 
+/// output = clamp(input, 0, max_val)^2
+pub fn squaredClippedRelu(self: *Graph, input: *Tensor, max_val: f32) !*Tensor {
+    const n: u32 = @intCast(input.elements());
+    const out_buf = try self.arena.alloc(@as(usize, n));
+    try self.ops.squaredClippedRelu(self.ctx, input.storage.gpu.buffer, out_buf, max_val, n);
+
+    var output = try self.createIntermediate(input.shape.dims(), out_buf);
+    output.tape_index = self.tape.entries.items.len;
+    try self.tape.append(.{
+        .saved = .{ .squared_clipped_relu = .{ .input = input, .max_val = max_val, .n = n } },
+        .output = output,
+    });
+    return output;
+}
+
 /// output = 1 / (1 + exp(-input))
 pub fn sigmoid(self: *Graph, input: *Tensor) !*Tensor {
     const n: u32 = @intCast(input.elements());
@@ -250,6 +265,12 @@ fn backwardEntry(self: *Graph, entry: *const tape_mod.TapeEntry) !void {
             if (needsGrad(s.input)) {
                 const gi = try self.ensureGrad(s.input);
                 try self.ops.clippedReluBackward(self.ctx, s.input.storage.gpu.buffer, grad_out, gi, s.max_val, s.n);
+            }
+        },
+        .squared_clipped_relu => |s| {
+            if (needsGrad(s.input)) {
+                const gi = try self.ensureGrad(s.input);
+                try self.ops.squaredClippedReluBackward(self.ctx, s.input.storage.gpu.buffer, grad_out, gi, s.max_val, s.n);
             }
         },
         .sigmoid => |s| {
@@ -421,6 +442,38 @@ fn computeDenseLoss(
     return ops.reduceSum(ctx, out_buf, allocator);
 }
 
+/// Run forward pass (matmul -> addBias -> squaredClippedRelu) on raw buffers, return sum(output).
+fn computeSquaredClippedReluLoss(
+    allocator: std.mem.Allocator,
+    ctx: *const Context,
+    ops: *const Ops,
+    x: []const f32,
+    w: []const f32,
+    b: []const f32,
+    m: u32,
+    n: u32,
+    k: u32,
+    max_val: f32,
+) !f32 {
+    var x_buf = try Buffer.upload(ctx, x);
+    defer x_buf.release();
+    var w_buf = try Buffer.upload(ctx, w);
+    defer w_buf.release();
+    var b_buf = try Buffer.upload(ctx, b);
+    defer b_buf.release();
+
+    var h_buf = try Buffer.alloc(ctx, @as(usize, m) * @as(usize, n));
+    defer h_buf.release();
+    try ops.matmul(ctx, x_buf, w_buf, h_buf, m, n, k);
+    try ops.addBias(ctx, h_buf, b_buf, m, n);
+
+    var out_buf = try Buffer.alloc(ctx, @as(usize, m) * @as(usize, n));
+    defer out_buf.release();
+    try ops.squaredClippedRelu(ctx, h_buf, out_buf, max_val, m * n);
+
+    return ops.reduceSum(ctx, out_buf, allocator);
+}
+
 fn relError(a: f32, n: f32) f32 {
     const diff = @abs(a - n);
     const scale = @max(@abs(a), @abs(n));
@@ -517,6 +570,98 @@ test "numerical gradient check: matmul + addBias + clippedRelu" {
         const err = relError(b_grad[idx], numerical);
         if (err > tol) {
             std.debug.print("bias grad[{d}]: analytical={d:.6}, numerical={d:.6}, rel_err={d:.6}\n", .{ idx, b_grad[idx], numerical, err });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "numerical gradient check: matmul + addBias + squaredClippedRelu" {
+    var ctx = try Context.init();
+    defer ctx.deinit();
+    var ops = try Ops.init(&ctx);
+    defer ops.deinit();
+    const allocator = std.testing.allocator;
+
+    const M: u32 = 2;
+    const K: u32 = 4;
+    const N: u32 = 3;
+    const max_val: f32 = 6.0;
+
+    // Parameters with moderate values away from the activation boundaries (0, max_val)
+    // so the squared activation's derivative (2x in-region) is smooth for finite diffs.
+    var w_data = [_]f32{ 0.15, -0.22, 0.31, 0.41, -0.12, 0.25, -0.33, 0.18, 0.27, -0.14, 0.36, 0.08 };
+    var b_data = [_]f32{ 0.05, -0.03, 0.07 };
+    const x_data = [_]f32{ 0.5, 0.3, 0.8, 0.2, 0.9, 0.1, 0.4, 0.6 };
+
+    // -- Analytical gradients via autograd --
+    const w_buf = try Buffer.upload(&ctx, &w_data);
+    var weight = makeTensor(allocator, &.{ K, N }, w_buf);
+    weight.requires_grad = true;
+    defer weight.deinit();
+
+    const b_buf = try Buffer.upload(&ctx, &b_data);
+    var bias = makeTensor(allocator, &.{N}, b_buf);
+    bias.requires_grad = true;
+    defer bias.deinit();
+
+    const x_buf = try Buffer.upload(&ctx, &x_data);
+    var input = makeTensor(allocator, &.{ M, K }, x_buf);
+    defer input.deinit();
+
+    var graph = Graph.init(allocator, &ctx, &ops);
+    defer graph.deinit();
+
+    const h1 = try graph.matmul(&input, &weight);
+    const h2 = try graph.addBias(h1, &bias);
+    const h3 = try graph.squaredClippedRelu(h2, max_val);
+
+    // loss = sum(output), so dL/d(output) = all 1s
+    try graph.setGrad(h3, 1.0);
+    try graph.backward(h3);
+
+    var w_grad: [K * N]f32 = undefined;
+    try weight.grad.?.storage.gpu.buffer.download(&ctx, &w_grad);
+    var b_grad: [N]f32 = undefined;
+    try bias.grad.?.storage.gpu.buffer.download(&ctx, &b_grad);
+
+    // -- Numerical gradients via finite differences --
+    const eps: f32 = 1e-3;
+    const tol: f32 = 2e-2;
+
+    for (0..K * N) |idx| {
+        const orig = w_data[idx];
+
+        w_data[idx] = orig + eps;
+        const loss_plus = try computeSquaredClippedReluLoss(allocator, &ctx, &ops, &x_data, &w_data, &b_data, M, N, K, max_val);
+
+        w_data[idx] = orig - eps;
+        const loss_minus = try computeSquaredClippedReluLoss(allocator, &ctx, &ops, &x_data, &w_data, &b_data, M, N, K, max_val);
+
+        w_data[idx] = orig;
+
+        const numerical = (loss_plus - loss_minus) / (2.0 * eps);
+        const err = relError(w_grad[idx], numerical);
+        if (err > tol) {
+            std.debug.print("scrl weight grad[{d}]: analytical={d:.6}, numerical={d:.6}, rel_err={d:.6}\n", .{ idx, w_grad[idx], numerical, err });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    for (0..N) |idx| {
+        const orig = b_data[idx];
+
+        b_data[idx] = orig + eps;
+        const loss_plus = try computeSquaredClippedReluLoss(allocator, &ctx, &ops, &x_data, &w_data, &b_data, M, N, K, max_val);
+
+        b_data[idx] = orig - eps;
+        const loss_minus = try computeSquaredClippedReluLoss(allocator, &ctx, &ops, &x_data, &w_data, &b_data, M, N, K, max_val);
+
+        b_data[idx] = orig;
+
+        const numerical = (loss_plus - loss_minus) / (2.0 * eps);
+        const err = relError(b_grad[idx], numerical);
+        if (err > tol) {
+            std.debug.print("scrl bias grad[{d}]: analytical={d:.6}, numerical={d:.6}, rel_err={d:.6}\n", .{ idx, b_grad[idx], numerical, err });
             return error.TestUnexpectedResult;
         }
     }

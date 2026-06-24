@@ -8,6 +8,7 @@ const Ops = @This();
 // Forward ops
 add_bias_prog: Program,
 clipped_relu_prog: Program,
+squared_clipped_relu_prog: Program,
 sigmoid_prog: Program,
 sparse_accumulate_prog: Program,
 concat_prog: Program,
@@ -22,6 +23,7 @@ matmul_backward_input_prog: Program,
 matmul_backward_weight_prog: Program,
 add_bias_backward_prog: Program,
 clipped_relu_backward_prog: Program,
+squared_clipped_relu_backward_prog: Program,
 sigmoid_backward_prog: Program,
 sparse_accumulate_backward_prog: Program,
 weighted_add_prog: Program,
@@ -40,6 +42,8 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
     errdefer p_add_bias.release();
     var p_clipped_relu = try Program.create(ctx, @embedFile("kernels/clipped_relu.cl"), "clipped_relu");
     errdefer p_clipped_relu.release();
+    var p_sq_clipped_relu = try Program.create(ctx, @embedFile("kernels/squared_clipped_relu.cl"), "squared_clipped_relu");
+    errdefer p_sq_clipped_relu.release();
     var p_sigmoid = try Program.create(ctx, @embedFile("kernels/sigmoid.cl"), "sigmoid");
     errdefer p_sigmoid.release();
     var p_sparse = try Program.create(ctx, @embedFile("kernels/sparse_accumulate.cl"), "sparse_accumulate");
@@ -66,6 +70,8 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
     errdefer p_ab_b.release();
     var p_cr_b = try Program.create(ctx, @embedFile("kernels/clipped_relu_backward.cl"), "clipped_relu_backward");
     errdefer p_cr_b.release();
+    var p_scr_b = try Program.create(ctx, @embedFile("kernels/squared_clipped_relu_backward.cl"), "squared_clipped_relu_backward");
+    errdefer p_scr_b.release();
     var p_sig_b = try Program.create(ctx, @embedFile("kernels/sigmoid_backward.cl"), "sigmoid_backward");
     errdefer p_sig_b.release();
     var p_sp_b = try Program.create(ctx, @embedFile("kernels/sparse_accumulate_backward.cl"), "sparse_accumulate_backward");
@@ -84,6 +90,7 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
     return .{
         .add_bias_prog = p_add_bias,
         .clipped_relu_prog = p_clipped_relu,
+        .squared_clipped_relu_prog = p_sq_clipped_relu,
         .sigmoid_prog = p_sigmoid,
         .sparse_accumulate_prog = p_sparse,
         .concat_prog = p_concat,
@@ -96,6 +103,7 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
         .matmul_backward_weight_prog = p_mm_bw,
         .add_bias_backward_prog = p_ab_b,
         .clipped_relu_backward_prog = p_cr_b,
+        .squared_clipped_relu_backward_prog = p_scr_b,
         .sigmoid_backward_prog = p_sig_b,
         .sparse_accumulate_backward_prog = p_sp_b,
         .weighted_add_prog = p_wa,
@@ -109,6 +117,7 @@ pub fn init(ctx: *const Context) Context.Error!Ops {
 pub fn deinit(self: *Ops) void {
     self.add_bias_prog.release();
     self.clipped_relu_prog.release();
+    self.squared_clipped_relu_prog.release();
     self.sigmoid_prog.release();
     self.sparse_accumulate_prog.release();
     self.concat_prog.release();
@@ -121,6 +130,7 @@ pub fn deinit(self: *Ops) void {
     self.matmul_backward_weight_prog.release();
     self.add_bias_backward_prog.release();
     self.clipped_relu_backward_prog.release();
+    self.squared_clipped_relu_backward_prog.release();
     self.sigmoid_backward_prog.release();
     self.sparse_accumulate_backward_prog.release();
     self.weighted_add_prog.release();
@@ -152,6 +162,15 @@ pub fn clippedRelu(self: *const Ops, ctx: *const Context, input: Buffer, output:
     try self.clipped_relu_prog.setArg(2, max_val);
     try self.clipped_relu_prog.setArg(3, n);
     try self.clipped_relu_prog.dispatch(ctx, &.{@as(usize, n)}, null);
+}
+
+/// Element-wise squared clipped ReLU: output[i] = clamp(input[i], 0, max_val)^2
+pub fn squaredClippedRelu(self: *const Ops, ctx: *const Context, input: Buffer, output: Buffer, max_val: f32, n: u32) Context.Error!void {
+    try self.squared_clipped_relu_prog.setArg(0, input);
+    try self.squared_clipped_relu_prog.setArg(1, output);
+    try self.squared_clipped_relu_prog.setArg(2, max_val);
+    try self.squared_clipped_relu_prog.setArg(3, n);
+    try self.squared_clipped_relu_prog.dispatch(ctx, &.{@as(usize, n)}, null);
 }
 
 /// Element-wise sigmoid: output[i] = 1 / (1 + exp(-input[i]))
@@ -402,6 +421,24 @@ pub fn clippedReluBackward(
     try self.clipped_relu_backward_prog.setArg(3, max_val);
     try self.clipped_relu_backward_prog.setArg(4, n);
     try self.clipped_relu_backward_prog.dispatch(ctx, &.{@as(usize, n)}, null);
+}
+
+/// grad_input[i] += grad_output[i] * (0 < input[i] < max_val ? 2*input[i] : 0)
+pub fn squaredClippedReluBackward(
+    self: *const Ops,
+    ctx: *const Context,
+    input: Buffer,
+    grad_output: Buffer,
+    grad_input: Buffer,
+    max_val: f32,
+    n: u32,
+) Context.Error!void {
+    try self.squared_clipped_relu_backward_prog.setArg(0, input);
+    try self.squared_clipped_relu_backward_prog.setArg(1, grad_output);
+    try self.squared_clipped_relu_backward_prog.setArg(2, grad_input);
+    try self.squared_clipped_relu_backward_prog.setArg(3, max_val);
+    try self.squared_clipped_relu_backward_prog.setArg(4, n);
+    try self.squared_clipped_relu_backward_prog.dispatch(ctx, &.{@as(usize, n)}, null);
 }
 
 /// grad_input[i] += grad_output[i] * s[i] * (1 - s[i])

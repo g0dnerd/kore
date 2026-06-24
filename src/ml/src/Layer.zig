@@ -4,15 +4,17 @@ const Graph = @import("Graph.zig");
 const Linear = @import("Linear.zig");
 const SparseLinear = @import("SparseLinear.zig");
 const ClippedReLU = @import("ClippedReLU.zig");
+const SquaredClippedReLU = @import("SquaredClippedReLU.zig");
 
 const Layer = @This();
 
-pub const Tag = enum { linear, sparse_linear, clipped_relu };
+pub const Tag = enum { linear, sparse_linear, clipped_relu, squared_clipped_relu };
 
 value: union(Tag) {
     linear: Linear,
     sparse_linear: SparseLinear,
     clipped_relu: ClippedReLU,
+    squared_clipped_relu: SquaredClippedReLU,
 },
 
 pub fn forward(self: *const Layer, input: *Tensor, graph: *Graph) !*Tensor {
@@ -20,6 +22,7 @@ pub fn forward(self: *const Layer, input: *Tensor, graph: *Graph) !*Tensor {
         .linear => |*l| l.forward(input, graph),
         .sparse_linear => |*l| l.forward(input, graph),
         .clipped_relu => |*l| l.forward(input, graph),
+        .squared_clipped_relu => |*l| l.forward(input, graph),
     };
 }
 
@@ -34,6 +37,7 @@ pub fn appendParameters(self: *const Layer, list: *std.ArrayList(*Tensor), alloc
             try list.appendSlice(allocator, &p);
         },
         .clipped_relu => {},
+        .squared_clipped_relu => {},
     }
 }
 
@@ -42,6 +46,7 @@ pub fn deinit(self: *Layer) void {
         .linear => |*l| l.deinit(),
         .sparse_linear => |*l| l.deinit(),
         .clipped_relu => |*l| l.deinit(),
+        .squared_clipped_relu => |*l| l.deinit(),
     }
     self.* = undefined;
 }
@@ -56,4 +61,8 @@ pub fn sparseLinear(l: SparseLinear) Layer {
 
 pub fn clippedRelu(max_val: f32) Layer {
     return .{ .value = .{ .clipped_relu = ClippedReLU.init(max_val) } };
+}
+
+pub fn squaredClippedRelu(max_val: f32) Layer {
+    return .{ .value = .{ .squared_clipped_relu = SquaredClippedReLU.init(max_val) } };
 }

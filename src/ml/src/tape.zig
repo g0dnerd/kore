@@ -6,6 +6,7 @@ pub const Op = enum {
     matmul,
     add_bias,
     clipped_relu,
+    squared_clipped_relu,
     sigmoid,
     sparse_accumulate,
     concat,
@@ -15,6 +16,7 @@ pub const SavedContext = union(enum) {
     matmul: Matmul,
     add_bias: AddBias,
     clipped_relu: ClippedReLU,
+    squared_clipped_relu: SquaredClippedReLU,
     sigmoid: Sigmoid,
     sparse_accumulate: SparseAccumulate,
     concat: Concat,
@@ -35,6 +37,12 @@ pub const SavedContext = union(enum) {
     };
 
     pub const ClippedReLU = struct {
+        input: *Tensor,
+        max_val: f32,
+        n: u32,
+    };
+
+    pub const SquaredClippedReLU = struct {
         input: *Tensor,
         max_val: f32,
         n: u32,
