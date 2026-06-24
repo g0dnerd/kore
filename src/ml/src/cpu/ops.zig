@@ -148,12 +148,31 @@ pub fn clippedRelu_i16(comptime n: usize, input: *const [n]i16) [n]i8 {
 //   - q² ≤ 127² = 16129 fits i32; the ÷127 runs once per FT output element (not in
 //     the per-weight matmul loop), so a non-power-of-2 divisor is fine here.
 pub fn squaredClippedRelu_i16(comptime n: usize, input: *const [n]i16) [n]i8 {
+    // Widen to i32 lanes so q² (≤127²=16129) and q²+63 stay in range.
+    const VecI32 = @Vector(vec_len_i16, i32);
+    const zero: VecI32 = @splat(0);
+    const max_v: VecI32 = @splat(127);
+    const round_bias: VecI32 = @splat(63);
+    const divisor: VecI32 = @splat(127);
+
     var out: [n]i8 = undefined;
-    for (0..n) |i| {
-        const q: i32 = @min(@max(@as(i32, input[i]), 0), 127);
+    const in_s: []const i16 = input;
+    var out_s: []i8 = &out;
+
+    const full = (n / vec_len_i16) * vec_len_i16;
+    var i: usize = 0;
+    while (i < full) : (i += vec_len_i16) {
+        const v16: VecI16 = in_s[i..][0..vec_len_i16].*;
+        const q: VecI32 = @min(@max(@as(VecI32, @intCast(v16)), zero), max_v);
         // round(q² / 127); q² + 63 rounds to nearest. Max (16129+63)/127 = 127.
+        const a: VecI32 = @divTrunc(q * q + round_bias, divisor);
+        const narrow: @Vector(vec_len_i16, i8) = @intCast(a);
+        out_s[i..][0..vec_len_i16].* = narrow;
+    }
+    while (i < n) : (i += 1) {
+        const q: i32 = @min(@max(@as(i32, in_s[i]), 0), 127);
         const a: i32 = @divTrunc(q * q + 63, 127);
-        out[i] = @intCast(a);
+        out_s[i] = @intCast(a);
     }
     return out;
 }
